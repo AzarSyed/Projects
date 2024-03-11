@@ -1,0 +1,188 @@
+import win32com.client
+import pythoncom
+from datetime import datetime, timedelta
+from isodate import parse_duration
+import csv
+import sqlite3
+
+folder_path = '\\'
+db_file_path = r"C:\Users\ADMIN\Desktop\Feb-23\New folder (3)\event_data.db"
+
+status_dict = {0: 'Unknown', 1: 'Disabled', 2: 'Queued', 3: 'Ready', 4: 'Running'}
+
+level_labels = {1: "Critical", 2: "Error", 3: "Warning", 4: "Information"}
+
+event_category_dict = {
+    100: "Task Started", 102: "Task completed", 103: "Action start failed",
+    106: "Task registered", 107: "Task triggered on scheduler", 108: "Task triggered on event",
+    109: "Task triggered by registration", 110: "Task triggered by user", 111: "Task terminated",
+    114: "Missed task started", 118: "Task triggered by computer startup", 119: "Task triggered on logon",
+    129: "Created Task Process", 140: "Task registration updated", 141: "Task registration deleted",
+    200: "Action started", 201: "Action completed", 202: "Action failed",
+    322: "Launch request ignored, instance already running", 325: "Launch request queued",
+    328: "Task stopping due to computer not idle", 411: "Service signaled time change"
+}
+
+def calculate_average_completion_time(task_name):
+    events = extract_events(task_name)
+    events_sorted = sorted(events, key=lambda x: x['TimeCreated'])
+    start_events = [event for event in events_sorted if event['EventID'] == 100]
+    completed_events = [event for event in events_sorted if event['EventID'] == 102]
+    
+    time_differences = [datetime.strptime(completed_event['TimeCreated'], '%Y-%m-%d %H:%M:%S') -
+                        datetime.strptime(start_event['TimeCreated'], '%Y-%m-%d %H:%M:%S')
+                        for start_event, completed_event in zip(start_events, completed_events)]
+    
+    if not time_differences:
+        return None
+    
+    min_time = min(time_differences)
+    max_time = max(time_differences)
+    
+    average_time = sum(time_differences, timedelta()) / len(time_differences)
+    hours_avg, remainder_avg = divmod(average_time.seconds, 3600)
+    minutes_avg, seconds_avg = divmod(remainder_avg, 60)
+    
+    hours_min, remainder_min = divmod(min_time.seconds, 3600)
+    minutes_min, seconds_min = divmod(remainder_min, 60)
+    
+    hours_max, remainder_max = divmod(max_time.seconds, 3600)
+    minutes_max, seconds_max = divmod(remainder_max, 60)
+   
+    return {
+        "min_time": '{:02} hr {:02} min {:02} sec'.format(hours_min, minutes_min, seconds_min),
+        "max_time": '{:02} hr {:02} min {:02} sec'.format(hours_max, minutes_max, seconds_max),
+        "average_time": '{:02} hr {:02} min {:02} sec'.format(hours_avg, minutes_avg, seconds_avg)
+    }
+
+def extract_events(task_name):
+    conn = sqlite3.connect(db_file_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM events WHERE task_name=?", (task_name,))
+    
+    events = []
+    for row in cursor.fetchall():
+        event_id, level = int(row[1]), int(row[2])
+        task_category = event_category_dict.get(event_id, 'Unknown')
+        
+        event_dict = {
+            "EventID": event_id,
+            "Level": level_labels.get(level, 'Unknown'),
+            "TimeCreated": row[0],
+            "TaskName": task_name,
+            "TaskCategory": task_category
+        }
+        events.append(event_dict)
+    
+    conn.close()
+    return sorted(events, key=lambda x: x['TimeCreated'], reverse=True)
+
+def get_task_scheduler_information(folder_path):
+    scheduler = win32com.client.Dispatch('Schedule.Service')
+    scheduler.Connect()
+    folder = scheduler.GetFolder(folder_path)
+    tasks_info = []
+
+    for task in folder.GetTasks(0):
+        if task.State in {3, 4}: 
+            user_account = task.Definition.Principal.UserID or task.Definition.Principal.GroupId
+            
+            task_info = {
+                'TaskName': task.Name,
+                'Author': task.Definition.RegistrationInfo.Author,
+                'User Account': user_account,
+                'URI': task.Definition.RegistrationInfo.URI,
+                'Description': task.Definition.RegistrationInfo.Description,
+                'Status': status_dict[task.State],
+                'Triggers': [],
+            }
+            
+            for trigger in task.Definition.Triggers:
+                trigger_info = {
+                    'ExecutionTimeLimit': trigger.ExecutionTimeLimit,
+                    'Repetition': {
+                        'Interval': trigger.Repetition.Interval,
+                        'Duration': trigger.Repetition.Duration,
+                    }
+                }
+                task_info['Triggers'].append(trigger_info)
+
+            tasks_info.append(task_info)
+
+    for subfolder in folder.GetFolders(0):
+        tasks_info.extend(get_task_scheduler_information(subfolder))
+
+    return tasks_info
+
+def format_time(interval):
+    if not interval:
+        return 'Not Set'
+    duration = parse_duration(interval)
+    hours = duration.days * 24 + duration.seconds // 3600
+    minutes = (duration.seconds % 3600) // 60
+    seconds = duration.seconds % 60
+    return '{:02} hr {:02} min {:02} sec'.format(hours, minutes, seconds)
+
+if __name__ == "__main__":
+    pythoncom.CoInitialize()
+    try:
+        tasks = list(get_task_scheduler_information(folder_path))
+        tasks = sorted(tasks, key=lambda x: x['TaskName'].lower())
+
+        with open('task_information1.csv', 'w', newline='') as csvfile:
+            fieldnames = ['TaskName', 'Status','Author', 'User Account', 'Location', 'Description', 'Trigger', 'Repetition Interval', 'Action Termination Time', 'Min-Completion Time', 'Max-Completion Time', 'Average Completion Time']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for task in tasks:
+                completion_times = calculate_average_completion_time(task['TaskName'])
+                if task['Triggers']:
+                    for i, trigger in enumerate(task['Triggers'], start=1):
+                        if i == 1:
+                            writer.writerow({
+                                'TaskName': task['TaskName'],
+                                'Status': task['Status'],
+                                'Author': task['Author'] if task['Author'] else 'N/A',
+                                'User Account': task['User Account'] if task['User Account'] else 'N/A',
+                                'Location': task['URI'],
+                                'Description': task['Description'] if task['Description'] else 'N/A',
+                                'Trigger': i,
+                                'Repetition Interval': format_time(trigger["Repetition"]['Interval']),
+                                'Action Termination Time': format_time(trigger["ExecutionTimeLimit"]),
+                                'Min-Completion Time': completion_times.get('min_time', 'N/A') if completion_times else 'N/A',
+                                'Max-Completion Time': completion_times.get('max_time', 'N/A') if completion_times else 'N/A',
+                                'Average Completion Time': completion_times.get('average_time', 'N/A') if completion_times else 'N/A'
+                            })
+                        else:
+                            writer.writerow({
+                                'TaskName': '',
+                                'Status': '',                               
+                                'Author': '',
+                                'User Account': '',
+                                'Location': '',
+                                'Description': '',
+                                'Trigger': i,
+                                'Repetition Interval': format_time(trigger["Repetition"]['Interval']),
+                                'Action Termination Time': format_time(trigger["ExecutionTimeLimit"]),
+                                'Min-Completion Time': '',
+                                'Max-Completion Time': '',
+                                'Average Completion Time':'',
+                            })
+                else:
+                    writer.writerow({
+                        'TaskName': task['TaskName'],
+                        'Status': task['Status'],
+                        'Author': task['Author'] if task['Author'] else 'N/A',
+                        'User Account': task['User Account'] if task['User Account'] else 'N/A',
+                        'Location': task['URI'],
+                        'Description': task['Description'] if task['Description'] else 'N/A',
+                        'Trigger': 'N/A',
+                        'Repetition Interval': 'N/A',
+                        'Action Termination Time': 'N/A',
+                        'Min-Completion Time': completion_times.get('min_time', 'N/A') if completion_times else 'N/A',
+                        'Max-Completion Time': completion_times.get('max_time', 'N/A') if completion_times else 'N/A',
+                        'Average Completion Time': completion_times.get('average_time', 'N/A') if completion_times else 'N/A'
+                    })
+    finally:
+        pythoncom.CoUninitialize()
+
